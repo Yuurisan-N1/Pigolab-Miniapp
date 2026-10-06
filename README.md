@@ -2,7 +2,7 @@
 
 <img width="100%" alt="header" src="https://capsule-render.vercel.app/api?type=waving&height=210&text=PigoLab%20Bot&fontAlign=50&fontAlignY=36&fontSize=56&desc=Rig%20Cycles%7CLink%20Tasks%7CChannel%20Joins%7CLeaderboard%7CCountdown"/>
 
-<img alt="typing" src="https://readme-typing-svg.demolab.com?font=Inter&size=18&duration=3000&pause=650&center=true&vCenter=true&width=900&lines=Full%20daily%20cycle%20automation%20for%20the%20PigoLab%20Miniapp;The%20rig%20cycle%20is%20started%20and%20claimed%20when%20it%20finishes;Link%20tasks%20held%20for%20the%20server%20dwell%20time%20then%20claimed;Rewards%20only%20reported%20after%20the%20balance%20really%20moves;Multi%20account%20with%20proxy%20support%20and%20a%20live%20countdown%20between%20cycles"/>
+<img alt="typing" src="https://readme-typing-svg.demolab.com?font=Inter&size=18&duration=3000&pause=650&center=true&vCenter=true&width=900&lines=Full%20daily%20cycle%20automation%20for%20the%20PigoLab%20Miniapp;The%20rig%20cycle%20is%20started%20and%20claimed%20only%20once%20the%20cycle%20really%20ends;Link%20tasks%20held%20for%20the%20server%20dwell%20time%20then%20claimed;The%20spin%20wheel%20is%20used%20whenever%20the%20account%20still%20holds%20a%20spin;Multi%20account%20with%20proxy%20support%20and%20a%20live%20countdown%20between%20cycles"/>
 
 <p>
   <img alt="python" src="https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white"/>
@@ -85,7 +85,15 @@ Proxies are assigned to accounts by index in round-robin order.
 
 ### 3. Bot Settings (config.json)
 
-`sleep_seconds` controls how many seconds the bot waits between cycles. If `config.json` is missing, it is created automatically with a default of `3600` seconds.
+`sleep_seconds` controls how many seconds the bot waits between cycles, shortened automatically when a rig cycle is about to end. If `config.json` is missing, it is created automatically with a default of `3600` seconds.
+
+```json
+{
+  "settings": {
+    "sleep_seconds": 3600
+  }
+}
+```
 
 ---
 
@@ -120,6 +128,10 @@ Tasks that need a real Telegram channel join are attempted once and then reporte
 ### Referral Tasks
 
 Tasks that need real invited friends are summarised at the end of the task phase instead of being retried, since the bot cannot invent friends.
+
+### Spin Wheel
+
+Whenever the account still holds a spin, the wheel is used once and the prize is reported: a PIGO payout is logged as a verified PIGO amount and a USDT payout is logged separately, because the two currencies are tracked apart. An account with no spins left is reported instead of hammering the endpoint.
 
 ### Leaderboard Tracking
 

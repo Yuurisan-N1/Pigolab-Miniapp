@@ -1,34 +1,25 @@
 import os
 import sys
 import json
-import random
-import asyncio
+import time
 import signal
+import hashlib
+import asyncio
 import aiohttp
+
 from urllib.parse import parse_qs, unquote
+
 from utils.banner import show_banner
 
-MY_PROJECT = "PigoLab Miniapp"
-BASE_URL = "https://app.pigolab.com/api"
-REF_CODE = "ref_6004380466"
-
-RESET = "\033[0m"
-BOLD = "\033[1m"
-RED = "\033[91m"
-GREEN = "\033[92m"
+RESET  = "\033[0m"
+BOLD   = "\033[1m"
+RED    = "\033[91m"
+GREEN  = "\033[92m"
 YELLOW = "\033[93m"
 
-HEADERS_BASE = {
-    "accept": "application/json, text/plain, */*",
-    "content-type": "application/json",
-    "origin": "https://app.pigolab.com",
-    "referer": "https://app.pigolab.com/",
-    "user-agent": "Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36",
-}
-
-TASK_DWELL = 9
-
-PENDING_GAPS = {}
+MY_PROJECT = "PigoLab Miniapp"
+BASE_URL   = "https://app.pigolab.com"
+REF_CODE   = "ref_6004380466"
 
 
 def log_green(msg):
@@ -44,66 +35,66 @@ def log_red(msg):
 
 
 def signal_handler(sig, frame):
-    print(flush=True)
+    print()
     log_red("Script stopped by user")
-    sys.stdout.flush()
-    sys.stderr.flush()
-    os._exit(0)
+    sys.exit(0)
 
 
 signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
 
 
-def clean_text(value, fallback):
-    if value is None:
-        return str(fallback)
-    text = str(value)
-    for symbol in "[]|#!@$%^&*()-+=~`,:;'\"<>?/\\":
-        text = text.replace(symbol, " ")
-    text = "".join(char for char in text if ord(char) < 128)
+def clean_text(value, fallback="unknown"):
+    text = str(value if value is not None else "").strip()
+    for ch in "[]|#!@$%^&*()-":
+        text = text.replace(ch, " ")
     text = " ".join(text.split())
-    return text if text else str(fallback)
+    return text[:120] if text else fallback
 
 
-def shorten(value, fallback, limit):
-    text = clean_text(value, fallback)
-    if len(text) <= limit:
-        return text
-    cut = text[: limit + 1]
-    space = cut.rfind(" ")
-    return cut[:space].rstrip() if space > 0 else text[:limit].rstrip()
+def normalize_proxy(proxy_line):
+    if not proxy_line:
+        return None
+    value = proxy_line.strip()
+    if "://" in value:
+        return value
+    parts = value.split(":")
+    if len(parts) == 4:
+        host, port, user, password = parts
+        return f"http://{user}:{password}@{host}:{port}"
+    if len(parts) == 3:
+        host, port, user = parts
+        return f"http://{user}@{host}:{port}"
+    return f"http://{value}"
 
 
-def format_amount(value):
+def mask_proxy(proxy_url):
     try:
-        number = float(value)
+        after_at = proxy_url.split("@")[-1]
+        host_part = after_at.split(":")[0]
+        port_part = after_at.split(":")[1] if ":" in after_at else ""
+        octets = host_part.split(".")
+        if len(octets) == 4:
+            masked_host = f"{octets[0]}*****{octets[3]}"
+        else:
+            masked_host = "***"
+        suffix = f":{port_part}" if port_part else ""
+        return f"http://user:pass@{masked_host}{suffix}"
     except Exception:
-        return "0"
-    if number != number or number == 0:
-        return "0"
-    text = f"{number:.4f}" if abs(number) >= 1 else f"{number:.8f}"
-    text = text.rstrip("0").rstrip(".")
-    return text or "0"
+        return "http://user:pass@***:***"
 
 
-def format_duration(seconds):
-    total = int(max(seconds, 0))
-    hours, rest = divmod(total, 3600)
-    minutes, secs = divmod(rest, 60)
-    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
-
-
-def display_name(account):
-    for value in (account.get("username"), account.get("firstName")):
-        name = clean_text(value, "")
-        if name:
-            return name
-    return "Unknown"
-
-
-def plural(count, word):
-    return word if int(count) == 1 else f"{word}s"
+def countdown(seconds, label):
+    start = time.time()
+    while True:
+        remaining = seconds - (time.time() - start)
+        if remaining <= 0:
+            print(f"\r{' ' * 70}\r", end="", flush=True)
+            break
+        h = int(remaining // 3600)
+        m = int((remaining % 3600) // 60)
+        s = int(remaining % 60)
+        print(f"\r{YELLOW}{BOLD}{label} {h:02d}:{m:02d}:{s:02d}{RESET}", end="", flush=True)
+        time.sleep(1)
 
 
 def load_config():
@@ -111,37 +102,43 @@ def load_config():
     if not os.path.exists("config.json"):
         return defaults
     try:
-        with open("config.json") as handle:
-            loaded = json.load(handle)
+        with open("config.json") as f:
+            return json.load(f)
     except Exception:
         return defaults
-    settings = loaded.get("settings")
-    if not isinstance(settings, dict):
-        return defaults
-    merged = dict(defaults["settings"])
-    merged.update(settings)
-    return {"settings": merged}
 
 
-def load_lines(filename, required):
-    if not os.path.exists(filename):
-        if required:
-            log_red(f"File {clean_text(filename, 'data.txt')} was not found")
-            sys.exit(1)
-        return []
-    lines = [line.strip() for line in open(filename).readlines() if line.strip()]
-    if required and not lines:
-        log_red("File data.txt is empty and holds no initData string")
+def load_accounts():
+    if not os.path.exists("data.txt"):
+        log_red("File data.txt was not found.")
+        sys.exit(1)
+    lines = [l.strip() for l in open("data.txt").readlines() if l.strip()]
+    if not lines:
+        log_red("File data.txt is empty.")
         sys.exit(1)
     return lines
+
+
+def load_proxies():
+    if not os.path.exists("proxy.txt"):
+        return []
+    try:
+        return [l.strip() for l in open("proxy.txt").readlines() if l.strip()]
+    except Exception:
+        return []
+
+
+def get_proxy(proxies, idx):
+    if not proxies:
+        return None
+    return proxies[idx % len(proxies)]
 
 
 def parse_init_data(line):
     value = line.strip()
     if "tgWebAppData=" in value:
         value = value.split("tgWebAppData=", 1)[1]
-        value = value.split("&tgWebAppVersion")[0]
-        value = value.split("&tgWebAppPlatform")[0]
+        value = value.split("&tgWebAppVersion")[0].split("&tgWebAppPlatform")[0]
         value = unquote(value)
     fields = parse_qs(value, keep_blank_values=True)
     raw_user = (fields.get("user") or [""])[0]
@@ -165,305 +162,244 @@ def parse_init_data(line):
         "plab": 0.0,
         "usdt": 0.0,
         "spins": 0,
-        "rank": 0,
         "mining": {},
         "gap": 0,
     }
 
 
-def referrer_code_of(account):
-    value = clean_text(account.get("startParam") or REF_CODE, "")
-    return value.replace(" ", "") or str(REF_CODE)
-
-
-def device_line(telegram_id):
-    seed = int("".join(char for char in str(telegram_id) if char.isdigit()) or 0)
-    engine = random.Random(seed)
-    width = engine.choice([360, 384, 392, 412, 432])
-    height = engine.choice([640, 740, 780, 800, 915])
-    depth = engine.choice([24, 30])
-    ratio = engine.choice(["1", "1.5", "2", "2.625", "3"])
-    platform = engine.choice(["Linux aarch64", "Linux armv8l"])
-    cores = engine.choice([4, 6, 8])
-    memory = engine.choice([4, 6, 8])
-    touch = engine.choice([5, 10])
+def device_line(account):
+    digest = hashlib.sha256(account["initData"].encode("utf-8")).hexdigest()
+    number = int(digest[:16], 16)
+    widths = (360, 384, 392, 412, 432)
+    heights = (640, 740, 780, 800, 915)
+    ratios = ("1", "1.5", "2", "2.625", "3")
+    platforms = ("Linux aarch64", "Linux armv8l")
+    depth = (24, 30)[number % 2]
+    cores = (4, 6, 8)[number % 3]
+    memory = (4, 6, 8)[(number // 3) % 3]
+    touch = (5, 10)[(number // 9) % 2]
     return "|".join([
-        str(width), str(height), str(depth), ratio, "Asia/Jakarta", "en-US",
-        platform, str(cores), str(memory), str(touch),
+        str(widths[number % len(widths)]),
+        str(heights[(number // 5) % len(heights)]),
+        str(depth),
+        ratios[(number // 7) % len(ratios)],
+        "Asia/Jakarta",
+        "en-US",
+        platforms[(number // 11) % len(platforms)],
+        str(cores),
+        str(memory),
+        str(touch),
     ])
 
 
-def normalize_proxy(proxy_line):
-    if not proxy_line:
-        return None
-    value = proxy_line.strip()
-    if "://" in value:
-        return value
-    parts = value.split(":")
-    if len(parts) == 4:
-        host, port, user, password = parts
-        return f"http://{user}:{password}@{host}:{port}"
-    if len(parts) == 3:
-        host, port, user = parts
-        return f"http://{user}@{host}:{port}"
-    return f"http://{value}"
+def build_headers(account):
+    return {
+        "accept": "application/json, text/plain, */*",
+        "content-type": "application/json",
+        "origin": BASE_URL,
+        "referer": BASE_URL + "/",
+        "user-agent": "Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Mobile Safari/537.36",
+        "x-init-data": account["initData"],
+        "x-device": account["device"],
+    }
 
 
-def mask_proxy(proxy_url):
-    try:
-        value = proxy_url.split("://")[-1]
-        after_at = value.split("@")[-1]
-        host_part = after_at.split(":")[0]
-        port_part = after_at.split(":")[1] if ":" in after_at else ""
-        octets = host_part.split(".")
-        if len(octets) == 4:
-            masked_host = f"{octets[0]}*****{octets[3]}"
-        elif len(host_part) > 4:
-            masked_host = f"{host_part[:2]}*****{host_part[-2:]}"
-        else:
-            masked_host = "***"
-        suffix = f":{port_part}" if port_part else ""
-        return f"http://user:pass@{masked_host}{suffix}"
-    except Exception:
-        return "http://user:pass@***:***"
-
-
-def busy_error(status, payload):
-    if status in (429, 500, 502, 503, 504):
-        return True
-    message = ""
-    if isinstance(payload, dict):
-        for key in ("message", "error"):
-            if payload.get(key):
-                message = str(payload[key])
-                break
-    return "busy" in message.lower() or "timeout" in message.lower()
-
-
-def error_message(payload):
-    if isinstance(payload, dict) and payload.get("error"):
-        return str(payload["error"])
+def error_text(data):
+    if isinstance(data, dict):
+        return str(data.get("error") or data.get("message") or "")
     return ""
 
 
-def number_float(mapping, key, fallback=0.0):
-    if not isinstance(mapping, dict):
-        return fallback
-    value = mapping.get(key)
-    if value is None or value == "":
-        return fallback
-    try:
-        return float(value)
-    except Exception:
-        return fallback
-
-
-def number_of(mapping, key, fallback=0):
-    return int(number_float(mapping, key, fallback))
-
-
-def text_of(mapping, key, fallback):
-    if not isinstance(mapping, dict):
-        return str(fallback)
-    value = mapping.get(key)
-    if value is None:
-        return str(fallback)
-    return str(value)
-
-
-async def countdown(seconds, label):
-    left = int(max(seconds, 0))
-    if left < 1:
-        return
-    text = clean_text(label, "Next cycle")
-    while left > 0:
-        print(
-            f"\r{YELLOW}{BOLD}{text} {format_duration(left)}{RESET}",
-            end="",
-            flush=True,
-        )
-        await asyncio.sleep(1)
-        left -= 1
-    print(f"\r{' ' * 70}\r", end="", flush=True)
-
-
-def device_of(account):
-    device = account.get("device")
-    if device:
-        return device
-    account["device"] = device_line(account["id"])
-    return account["device"]
-
-
-async def api_call(session, account, path, body=None, proxy=None, method="POST"):
-    url = f"{BASE_URL}{path}"
-    seed = account.get("seed")
-    if seed is None:
-        seed = account.get("startParam") or REF_CODE
-        account["seed"] = seed
-    headers = dict(HEADERS_BASE)
-    headers["x-init-data"] = account["initData"]
-    headers["x-device"] = device_of(account)
-    payload = None
-    if method == "POST":
-        payload = {"startParam": seed}
-        if body:
-            payload.update(body)
-    last_status = 0
-    last_payload = None
-    for attempt in range(1, 4):
-        try:
-            request = session.request(
-                method,
-                url,
-                headers=headers,
-                json=payload,
-                proxy=proxy,
-                timeout=aiohttp.ClientTimeout(total=40),
-            )
-            async with request as response:
-                last_status = response.status
-                text = await response.text()
-                try:
-                    last_payload = json.loads(text)
-                except Exception:
-                    last_payload = None
-                if response.status < 400 or not busy_error(response.status, last_payload):
-                    return last_status, last_payload
-        except Exception:
-            last_status = 0
-            last_payload = None
-        if attempt < 3:
-            await asyncio.sleep(4 * attempt)
-    return last_status, last_payload
-
-
-def store_user(account, payload):
-    user = payload.get("user") if isinstance(payload, dict) else None
-    if not isinstance(user, dict):
-        user = payload if isinstance(payload, dict) and payload.get("id") else None
-    if not isinstance(user, dict):
-        return {}
-    account["plab"] = number_float(user, "plab")
-    account["usdt"] = number_float(user, "usdt")
-    account["spins"] = number_of(user, "spins")
-    mining = user.get("mining")
-    if isinstance(mining, dict):
-        account["mining"] = mining
-        account["gap"] = rig_gap(mining)
-    return user
-
-
-def rig_gap(mining):
+def mining_gap(mining):
     if not isinstance(mining, dict) or not mining.get("active"):
         return 0
-    ends = number_float(mining, "endsAt")
-    now = number_float(mining, "serverNow")
-    if ends <= 0 or now <= 0:
+    try:
+        now = float(mining.get("serverNow") or 0)
+        ends = float(mining.get("endsAt") or 0)
+        if ends <= 0:
+            ends = float(mining.get("startedAt") or 0) + float(mining.get("cycleMs") or 0)
+    except Exception:
+        return 0
+    if now <= 0 or ends <= 0:
         return 0
     return max(int((ends - now) / 1000) + 2, 0)
 
 
+async def api_call(session, account, path, body=None, proxy=None, method="POST"):
+    url = f"{BASE_URL}/api/{path}"
+    payload = None
+    if method == "POST":
+        payload = {"startParam": account.get("startParam") or REF_CODE}
+        if body:
+            payload.update(body)
+    status = 0
+    data = None
+    for attempt in range(1, 4):
+        try:
+            async with session.request(
+                method,
+                url,
+                headers=build_headers(account),
+                json=payload,
+                proxy=proxy,
+                timeout=aiohttp.ClientTimeout(total=40),
+            ) as response:
+                status = response.status
+                try:
+                    data = json.loads(await response.text())
+                except Exception:
+                    data = None
+                if status not in (429, 500, 502, 503, 504):
+                    return status, data
+        except Exception:
+            status = 0
+            data = None
+        if attempt < 3:
+            countdown(4 * attempt, "Retry in")
+    return status, data
+
+
+def store_user(account, payload):
+    user = payload.get("user") if isinstance(payload, dict) else None
+    if not isinstance(user, dict) and isinstance(payload, dict) and payload.get("id"):
+        user = payload
+    if not isinstance(user, dict):
+        return {}
+    try:
+        account["plab"] = float(user.get("plab") or 0)
+    except Exception:
+        account["plab"] = 0.0
+    try:
+        account["usdt"] = float(user.get("usdt") or 0)
+    except Exception:
+        account["usdt"] = 0.0
+    try:
+        account["spins"] = int(float(user.get("spins") or 0))
+    except Exception:
+        account["spins"] = 0
+    mining = user.get("mining")
+    if isinstance(mining, dict):
+        account["mining"] = mining
+        account["gap"] = mining_gap(mining)
+    return user
+
+
 async def run_session(session, account, proxy):
-    status, payload = await api_call(session, account, "/session", None, proxy)
-    if status == 200 and isinstance(payload, dict) and payload.get("user"):
-        store_user(account, payload)
-        return payload.get("config") if isinstance(payload.get("config"), dict) else {}
-    return {}
+    status, data = await api_call(session, account, "session", None, proxy)
+    if status != 200 or not isinstance(data, dict) or not data.get("user"):
+        return None
+    store_user(account, data)
+    config = data.get("config")
+    return config if isinstance(config, dict) else {}
 
 
 async def run_tasks(session, account, proxy):
-    status, payload = await api_call(session, account, "/tasks", None, proxy, "GET")
-    if status != 200 or not isinstance(payload, dict) or not payload.get("tasks"):
+    status, data = await api_call(session, account, "tasks", None, proxy, "GET")
+    tasks = data.get("tasks") if isinstance(data, dict) else None
+    if status != 200 or not isinstance(tasks, list) or not tasks:
         log_yellow("The task list was not returned by the server")
-        return 0
-    earned = 0.0
-    done = 0
-    joined = 0
-    for task in payload.get("tasks"):
+        return
+    waiting = 0
+    for task in tasks:
         if not isinstance(task, dict):
             continue
-        title = shorten(task.get("title"), "task", 20)
-        if task.get("status") == "claimed":
+        name = clean_text(task.get("title") or task.get("id"), "task")
+        if str(task.get("status") or "") == "claimed":
             continue
-        kind = text_of(task, "type", "")
-        if kind == "referral":
-            done += 1
+        if str(task.get("type") or "") == "referral":
+            waiting += 1
             continue
-        status, started = await api_call(session, account, "/tasks/start", {"id": task.get("id")}, proxy)
+        status, data = await api_call(session, account, "tasks/start", {"id": task.get("id")}, proxy)
         if status != 200:
-            log_yellow(f"Task {clean_text(title, 'task')} could not be started")
-            continue
-        if kind == "telegram":
-            status, claimed = await api_call(
-                session, account, "/tasks/claim", {"id": task.get("id")}, proxy
-            )
-            if status == 200 and isinstance(claimed, dict) and claimed.get("status") == "claimed":
-                earned += number_float(claimed, "reward")
-                store_user(account, claimed)
-                log_green(
-                    f"Task {clean_text(title, 'task')} verified "
-                    f"{clean_text(format_amount(claimed.get('reward')), 0)} PIGO"
-                )
+            reason = error_text(data).lower()
+            if "already" in reason:
+                log_yellow(f"Task {name} was already claimed on this account")
+            elif "join" in reason or "member" in reason:
+                log_yellow(f"Task {name} needs a manual channel join first")
             else:
-                joined += 1
-                log_yellow(f"Task {clean_text(title, 'task')} waits for a real channel join")
+                log_red(f"Task {name} could not be started by the server")
             continue
-        await countdown(TASK_DWELL, "Next task in")
-        status, claimed = await api_call(
-            session, account, "/tasks/claim", {"id": task.get("id")}, proxy
-        )
-        if status == 200 and isinstance(claimed, dict) and claimed.get("status") == "claimed":
-            reward = number_float(claimed, "reward")
-            earned += reward
-            store_user(account, claimed)
-            log_green(
-                f"Task {clean_text(title, 'task')} verified "
-                f"{clean_text(format_amount(reward), 0)} PIGO"
-            )
+        countdown(9, "Next task in")
+        status, data = await api_call(session, account, "tasks/claim", {"id": task.get("id")}, proxy)
+        if status == 200 and isinstance(data, dict) and str(data.get("status") or "") == "claimed":
+            reward = data.get("reward", 0)
+            store_user(account, data)
+            log_green(f"Task {name} was verified and credited {reward} PIGO")
+            continue
+        reason = error_text(data).lower()
+        if "join" in reason or "member" in reason:
+            log_yellow(f"Task {name} needs a manual channel join first")
+        elif "already" in reason:
+            log_yellow(f"Task {name} was already claimed on this account")
         else:
-            log_yellow(f"Task {clean_text(title, 'task')} was refused by the server")
-    if done:
-        log_yellow(f"{clean_text(done, 0)} {clean_text(plural(done, 'task'), 'tasks')} still needs real friends")
-    if joined:
-        log_yellow(f"{clean_text(joined, 0)} {clean_text(plural(joined, 'task'), 'tasks')} need a real channel join")
-    return earned
+            log_red(f"Task {name} could not be claimed on this run")
+    if waiting:
+        log_yellow(f"{waiting} referral tasks still need real invited friends")
 
 
 async def run_mining(session, account, proxy):
     mining = account.get("mining") if isinstance(account.get("mining"), dict) else {}
     if mining.get("active"):
-        status, payload = await api_call(session, account, "/mining/claim", {}, proxy)
-        if status == 200 and isinstance(payload, dict) and payload.get("plab") is not None:
-            mined = number_float(payload, "mined")
-            store_user(account, payload)
-            log_green(f"Mining cycle credited {clean_text(format_amount(mined), 0)} PIGO")
+        gap = account.get("gap", 0)
+        if not mining.get("complete") and gap > 0:
+            h = gap // 3600
+            m = (gap % 3600) // 60
+            s = gap % 60
+            log_yellow(f"The mining cycle is still running and returns in {h:02d}:{m:02d}:{s:02d}")
+            return
+        status, data = await api_call(session, account, "mining/claim", {}, proxy)
+        if status == 200 and isinstance(data, dict) and data.get("mining") is not None:
+            mined = data.get("mined", 0)
+            store_user(account, data)
+            log_green(f"Mining cycle credited {mined} PIGO to this account")
         else:
-            left = account.get("gap", 0)
-            log_yellow(f"The mining cycle is still running and returns in {format_duration(left)}")
-            return 0.0
-    status, payload = await api_call(session, account, "/mining/start", {}, proxy)
-    if status == 200 and isinstance(payload, dict) and payload.get("mining"):
-        account["mining"] = payload["mining"]
-        account["gap"] = rig_gap(payload["mining"])
-        log_green(
-            "Mining rig started and the next claim returns in "
-            f"{format_duration(account['gap'])}"
-        )
-        return 0.0
-    log_yellow("The mining rig was refused with no reason")
-    return 0.0
+            log_red("Mining cycle claim was refused by the server")
+    status, data = await api_call(session, account, "mining/start", {}, proxy)
+    if status == 200 and isinstance(data, dict) and data.get("mining"):
+        account["mining"] = data["mining"]
+        account["gap"] = mining_gap(data["mining"])
+        gap = account["gap"]
+        h = gap // 3600
+        m = (gap % 3600) // 60
+        s = gap % 60
+        log_green(f"Mining rig started and the next claim returns in {h:02d}:{m:02d}:{s:02d}")
+        return
+    log_red("Mining rig start was refused by the server")
+
+
+async def run_spin(session, account, proxy):
+    if account.get("spins", 0) < 1:
+        log_yellow("Spin wheel has no spins left on this account")
+        return
+    status, data = await api_call(session, account, "spin", {}, proxy)
+    if status == 200 and isinstance(data, dict):
+        store_user(account, data)
+        kind = str(data.get("kind") or "plab").lower()
+        reward = data.get("reward", 0)
+        if kind == "usdt":
+            log_green(f"Spin wheel credited {reward} USDT to this account")
+        else:
+            log_green(f"Spin wheel credited {reward} PIGO to this account")
+        return
+    reason = error_text(data).lower()
+    if "already" in reason:
+        log_yellow("Spin wheel was already used on this account")
+    elif "spin" in reason or "not_enough" in reason:
+        log_yellow("Spin wheel has no spins left on this account")
+    else:
+        log_red("Spin wheel request was refused by the server")
 
 
 async def run_leaderboard(session, account, proxy):
-    status, payload = await api_call(session, account, "/leaderboard", None, proxy, "GET")
-    if status != 200 or not isinstance(payload, dict) or not payload.get("top"):
+    status, data = await api_call(session, account, "leaderboard", None, proxy, "GET")
+    top = data.get("top") if isinstance(data, dict) else None
+    if status != 200 or not isinstance(top, list) or not top:
         log_yellow("The leaderboard was not returned by the server")
         return
-    for position, entry in enumerate(payload["top"], 1):
+    total = len(top)
+    for position, entry in enumerate(top, 1):
         if isinstance(entry, dict) and str(entry.get("id")) == account["id"]:
-            account["rank"] = position
-            log_green(f"Leaderboard position {clean_text(position, 0)} of {clean_text(len(payload['top']), 0)} miners")
+            log_green(f"Leaderboard position {position} of {total} ranked miners")
             return
     log_yellow("This account is not ranked on the leaderboard yet")
 
@@ -471,85 +407,65 @@ async def run_leaderboard(session, account, proxy):
 async def process_account(line, proxy, index):
     account = parse_init_data(line)
     if not account:
-        log_red(f"Credential line {clean_text(index, 1)} is not valid initData")
-        return
+        log_red(f"Credential line {index} is not valid initData")
+        return 0
 
+    account["device"] = device_line(account)
     connector = aiohttp.TCPConnector(ssl=False)
 
     async with aiohttp.ClientSession(connector=connector) as session:
         config = await run_session(session, account, proxy)
-        if not config:
-            log_red(f"Sign in failed for account number {clean_text(index, 1)}")
-            return
+        if config is None:
+            log_red(f"Sign in failed for credential line {index}")
+            return 0
 
-        name = display_name(account)
-        log_green(
-            f"Signed in {clean_text(shorten(name, 'account', 18), 'account')} with "
-            f"{clean_text(format_amount(account['plab']), 0)} PIGO and "
-            f"{clean_text(format_amount(account['usdt']), 0)} USDT"
-        )
+        name = clean_text(account.get("username") or account.get("firstName"), "Unknown")
+        plab = account.get("plab", 0)
+        usdt = account.get("usdt", 0)
+        log_green(f"Signed in {name} with {plab} PIGO and {usdt} USDT")
 
         await run_tasks(session, account, proxy)
         await run_mining(session, account, proxy)
+        await run_spin(session, account, proxy)
         await run_leaderboard(session, account, proxy)
 
-        if account.get("gap", 0) > 0:
-            PENDING_GAPS[index] = account["gap"]
-
-        log_green(
-            f"Cycle closed with {clean_text(format_amount(account['plab']), 0)} PIGO and "
-            f"{clean_text(format_amount(account['usdt']), 0)} USDT"
-        )
+    return account.get("gap", 0)
 
 
 async def main_async(accounts, proxies, sleep_secs):
     cycle = 1
     while True:
-        log_yellow(f"Starting automation cycle number {clean_text(cycle, 0)}")
-
-        for index, line in enumerate(accounts):
-            if index > 0:
+        log_yellow(f"Starting automation cycle number {cycle}.")
+        gaps = []
+        for idx, line in enumerate(accounts):
+            if idx > 0:
                 print()
-            proxy_line = proxies[index % len(proxies)] if proxies else None
-            proxy_url = normalize_proxy(proxy_line) if proxy_line else None
+            proxy_url = normalize_proxy(get_proxy(proxies, idx))
             if proxy_url:
-                log_yellow(f"Using proxy {mask_proxy(proxy_url)}")
-            await process_account(line, proxy_url, index + 1)
-
-        log_yellow(f"Automation cycle number {clean_text(cycle, 0)} is complete")
-        cycle += 1
+                log_yellow(f"Using proxy {mask_proxy(proxy_url)}.")
+            gap = await process_account(line, proxy_url, idx + 1)
+            if gap:
+                gaps.append(gap)
+        log_yellow(f"All accounts processed for cycle number {cycle}.")
         wait_secs = int(sleep_secs)
-        gaps = [value for value in PENDING_GAPS.values() if value > 0]
-        PENDING_GAPS.clear()
         if gaps:
-            wait_secs = min(int(min(gaps)) + 2, wait_secs)
-        await countdown(wait_secs, "Next cycle starts in")
+            wait_secs = min(min(gaps) + 2, wait_secs)
+        countdown(wait_secs, "Next cycle starts in")
+        cycle += 1
         show_banner(MY_PROJECT)
 
 
 def main():
-    try:
-        sys.stdout.reconfigure(line_buffering=True)
-        sys.stderr.reconfigure(line_buffering=True)
-    except Exception:
-        pass
-
     show_banner(MY_PROJECT)
 
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-    settings = load_config().get("settings", {})
-    accounts = load_lines("data.txt", True)
-    proxies = load_lines("proxy.txt", False)
-    try:
-        asyncio.run(main_async(accounts, proxies, settings["sleep_seconds"]))
-    except KeyboardInterrupt:
-        print(flush=True)
-        log_red("Script stopped by user")
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os._exit(0)
+    config = load_config()
+    sleep_secs = config.get("settings", {}).get("sleep_seconds", 3600)
+    accounts = load_accounts()
+    proxies = load_proxies()
+    asyncio.run(main_async(accounts, proxies, sleep_secs))
 
 
 if __name__ == "__main__":
